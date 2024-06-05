@@ -1,6 +1,6 @@
 import numpy as np
 
-from scipy.spatial import KDTree
+from scipy.spatial import cKDTree
 
 class LJ:
     
@@ -71,7 +71,9 @@ class simple_md3d:
         """
         Neighbor list within rcut.
         """
-        kdtree = KDTree(x)
+        # kdtree = KDTree(x)
+        half_box = np.array(self.box)/2
+        kdtree = cKDTree(x+half_box, boxsize=self.box)
         nlist = kdtree.query_pairs(r=rcut, output_type='ndarray')
         
         return nlist
