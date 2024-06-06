@@ -10,28 +10,37 @@ class LJ:
         param['sigma'] = sigma: minima of double well.
         """
         self.param={}
-        
+
     def act(self, pos1, pos2):
         """
-        defining an act function taking simulation variable as input argument.
+        defining an act function performing calculation on positions.
         """
-        dist = np.linalg.norm(pos1 - pos2, axis=0)
+        dpos = pos1 - pos2
+        dist = np.linalg.norm(dpos, axis=1)
         R = self.param['sigma'] / dist
+        
         return 4 * self.param['epsilon'] * (R**12 - R**6)
     
     def deriv(self, pos1, pos2):
-        """derivative."""
-        dist = np.linalg.norm(pos1 - pos2, axis=0)
-        sigma = self.param['sigma']
+        """
+        derivatives.
+        """
+        dpos = pos1 - pos2
+        dist = np.linalg.norm(dpos, axis=1)
+        dist_sqr = dist*dist
         R = self.param['sigma'] / dist
-        return -4 * self.param['epsilon'] * (12 * R**12 - 6 * R**6) * (pos1 - pos2)
-    
+        force_divr2 = -4 * self.param['epsilon'] * (12 * R**12 - 6 * R**6) / dist_sqr
+        
+        return force_divr2[:, np.newaxis] * dpos
+        
 class simple_md3d:
     
-    def __init__(self, seed=0):
+    def __init__(self, seed=0, calc_pe=False):
         self._rng = np.random.default_rng(seed)
+        self.calc_pe = calc_pe
         self.pe = None
         self.nlist = None
+        self.ndim = 3
         
     def set_param(self, dt, kT=1.0, damping=1.0):
         self.dt = dt
@@ -48,13 +57,13 @@ class simple_md3d:
         self.box = box
         self.traj = [[0, self.init_x3d, self.init_v3d]]
     
-    def dvdt_f(self, x, v):
+    def dvdt_f(self, x, v, nlist):
 
-        dim=3
-        grad = np.zeros((self.num_particles, dim))
-        f = np.array([self.pe.deriv(x[self.nlist][idx][0], 
-                                    x[self.nlist][idx][1]) for idx in range(len(self.nlist))])
-        self.neighbor_sum(grad, self.nlist[:,0], f)
+        grad = np.zeros((self.num_particles, self.ndim))
+        pos1 = x[nlist][:,0,:]
+        pos2 = x[nlist][:,1,:]
+        f = self.pe.deriv(pos1, pos2)
+        self.neighbor_sum(grad, nlist[:,0], f)
 
         return - grad - self.damping * v
     
@@ -62,20 +71,23 @@ class simple_md3d:
         """
         Wiener noise.
         """
-        sigma = np.sqrt( 6 * kT * damping )
-        return np.random.normal(loc=0.0, 
+        sigma = np.sqrt( 2 * self.ndim * kT * damping )
+        return self._rng.normal(loc=0.0, 
                                 scale=sigma, 
-                                size=(self.num_particles,3))
+                                size=(self.num_particles, self.ndim))
 
-    def nlist_search(self, x, rcut):
+    def nlist_search(self, x, rcut, full=False):
         """
         Neighbor list within rcut.
         """
-        # kdtree = KDTree(x)
-        half_box = np.array(self.box)/2
-        kdtree = cKDTree(x+half_box, boxsize=self.box)
-        nlist = kdtree.query_pairs(r=rcut, output_type='ndarray')
-        
+        half_box = np.array(self.box)
+        ckdtree = cKDTree(x+half_box/2, boxsize=self.box)
+        # only count [i,j]
+        nlist = ckdtree.query_pairs(r=rcut, output_type='ndarray')
+        if full==True:
+            # [i,j] and [j,i] both in nlist.
+            nlist_swap = np.roll(nlist, shift=1, axis=1)
+            nlist = np.vstack((nlist, nlist_swap))
         return nlist
     
     def neighbor_sum(self, target, idx, vals):
@@ -106,9 +118,11 @@ class simple_md3d:
     
     def compute_pe(self, x, nlist):
         """
-        compute potential energy on-the-fly.
+        compute potential energy.
         """
-        pe_val = np.sum([self.pe.act(x[nlist][idx][0], x[nlist][idx][1]) for idx in range(len(nlist))])
+        pos1 = x[nlist][:,0,:]
+        pos2 = x[nlist][:,1,:]
+        pe_val = np.sum(self.pe.act(pos1, pos2))
         return pe_val
 
     def first_run(self):
@@ -130,29 +144,33 @@ class simple_md3d:
             xi0 = self.xi(self.kT, self.damping)
             
             _, x, v = self.traj[-1]
-            self.nlist = self.nlist_search(x, rcut=self.pe.param['r_cut'])
+            # use full nlist for force calculation.
+            nlist = self.nlist_search(x, rcut=self.pe.param['r_cut'], full=True)
+            self.nlist = nlist
             
             predict_x = x + self.dt * v
-            predict_v = v + self.dt * self.dvdt_f(x,v) \
-                          + xi0 * np.sqrt(self.dt)
+            predict_v = v + self.dt * self.dvdt_f(x,v,nlist) + xi0 * np.sqrt(self.dt)
             
             # apply periodic boundary condition
             predict_x = self.pbc(predict_x, self.box)
+            # use full nlist for force calculation.
+            nlist_pred = self.nlist_search(predict_x, rcut=self.pe.param['r_cut'], full=True)
             # perform velocity rescaling for constant kT
             predict_v = self.v_rescale(predict_v, self.kT)
             
             xf = x + 0.5 * self.dt * (predict_v + v)
-            vf = v + 0.5 * self.dt * (self.dvdt_f(predict_x,predict_v) + self.dvdt_f(x,v)) \
-                   + xi0 * np.sqrt(self.dt)
+            f_temp = self.dvdt_f(predict_x,predict_v,nlist_pred) + self.dvdt_f(x,v,nlist)
+            vf = v + 0.5 * self.dt * f_temp + xi0 * np.sqrt(self.dt)
             
             # apply periodic boundary condition
             xf = self.pbc(xf, self.box)
             # perform velocity rescaling for constant kT
-            vf = self.v_rescale(vf, self.kT)
+            if i%1==0:
+                vf = self.v_rescale(vf, self.kT)
     
             self.traj.append([i, xf, vf])
-            
-            # save total potential energy
-            pe_val = self.compute_pe(x, self.nlist)
-            self.traj_pe.append( pe_val )
+
+            if self.calc_pe==True:
+                nlist_pe = self.nlist_search(xf, rcut=self.pe.param['r_cut'], full=False)
+                self.pe = self.compute_pe(x, nlist_pe)
     
